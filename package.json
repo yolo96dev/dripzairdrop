@@ -1,0 +1,13 @@
+{
+  "name": "airdrop-keeper-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node keeper.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "near-api-js": "^5.1.1"
+  }
+}
