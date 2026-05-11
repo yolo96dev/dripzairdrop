@@ -34,7 +34,7 @@ const POLL_INTERVAL_MS = Number(
  *
  * IMPORTANT:
  * AIRDROP_BOT_ACCOUNT_ID is also used by the weekly keeper to finalize
- * the weekly payout contract.
+ * and batch-pay the weekly payout contract.
  */
 const AIRDROP_CONTRACT_ID = process.env.AIRDROP_CONTRACT_ID || "";
 const AIRDROP_BOT_ACCOUNT_ID = process.env.AIRDROP_BOT_ACCOUNT_ID || "";
@@ -75,9 +75,26 @@ const WEEKLY_START_DURATION_SEC =
  */
 const WEEKLY_END_METHOD = process.env.WEEKLY_END_METHOD || "";
 
+/**
+ * This now creates the payout snapshot only.
+ */
 const WEEKLY_FINALIZE_METHOD =
   process.env.WEEKLY_FINALIZE_METHOD || "finalize_weekly_payout";
 
+/**
+ * New chunked payout methods from the updated dripzweekly contract.
+ */
+const WEEKLY_PAYOUT_STATUS_METHOD =
+  process.env.WEEKLY_PAYOUT_STATUS_METHOD || "get_payout_status";
+
+const WEEKLY_BATCH_PAYOUT_METHOD =
+  process.env.WEEKLY_BATCH_PAYOUT_METHOD || "payout_weekly_batch";
+
+const WEEKLY_BATCH_LIMIT = Number(process.env.WEEKLY_BATCH_LIMIT || "3");
+
+/**
+ * Kept for backwards compatibility.
+ */
 const WEEKLY_IS_PAID_METHOD =
   process.env.WEEKLY_IS_PAID_METHOD || "is_epoch_paid";
 
@@ -87,7 +104,22 @@ const WEEKLY_AUTO_START_NEXT =
 const WEEKLY_FINALIZE_GAS =
   process.env.WEEKLY_FINALIZE_GAS || "300000000000000";
 
+const WEEKLY_BATCH_GAS =
+  process.env.WEEKLY_BATCH_GAS ||
+  process.env.WEEKLY_FINALIZE_GAS ||
+  "300000000000000";
+
 const WEEKLY_EPOCH_GAS = process.env.WEEKLY_EPOCH_GAS || "30000000000000";
+
+/**
+ * Small retry cooldown so a broken contract call does not burn gas every tick.
+ */
+const WEEKLY_FAILED_RETRY_COOLDOWN_MS = Number(
+  process.env.WEEKLY_FAILED_RETRY_COOLDOWN_MS || "300000"
+);
+
+let weeklyFinalizeFailedAt = 0;
+let weeklyBatchFailedAt = 0;
 
 /**
  * Required env checks.
@@ -109,7 +141,7 @@ if (WEEKLY_KEEPER_ENABLED) {
   if (!ADMIN_BOT_PRIVATE_KEY) throw new Error("Missing ADMIN_BOT_PRIVATE_KEY");
 
   /**
-   * Weekly finalize is signed by the airdrop bot.
+   * Weekly finalize and batch payout are signed by the airdrop bot.
    */
   if (!AIRDROP_BOT_ACCOUNT_ID) {
     throw new Error("Missing AIRDROP_BOT_ACCOUNT_ID for weekly payout finalize");
@@ -165,6 +197,17 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function nowMs() {
+  return Date.now();
+}
+
+function inCooldown(lastFailedAt) {
+  return (
+    lastFailedAt > 0 &&
+    nowMs() - lastFailedAt < WEEKLY_FAILED_RETRY_COOLDOWN_MS
+  );
+}
+
 async function viewContract(contractId, methodName, args = {}) {
   const res = await provider.query({
     request_type: "call_function",
@@ -178,6 +221,19 @@ async function viewContract(contractId, methodName, args = {}) {
   return raw ? JSON.parse(raw) : null;
 }
 
+async function safeViewContract(contractId, methodName, args = {}) {
+  try {
+    return await viewContract(contractId, methodName, args);
+  } catch (err) {
+    log(
+      "[view-error]",
+      `${contractId}.${methodName}`,
+      err?.message || String(err)
+    );
+    return null;
+  }
+}
+
 async function callWithAccount(
   signerAccount,
   contractId,
@@ -189,6 +245,15 @@ async function callWithAccount(
   if (!signerAccount) {
     throw new Error(`Missing signer account for ${contractId}.${methodName}`);
   }
+
+  log("[near-call]", {
+    signer: signerAccount.accountId,
+    contractId,
+    methodName,
+    args,
+    gas: String(gas),
+    deposit: String(deposit),
+  });
 
   return await signerAccount.functionCall({
     contractId,
@@ -243,7 +308,7 @@ async function callWeeklyXpStart() {
 }
 
 /**
- * Weekly payout finalize uses the airdrop bot signer.
+ * Weekly payout calls use the airdrop bot signer.
  */
 async function callWeeklyPayout(
   methodName,
@@ -284,7 +349,9 @@ async function ensureWeeklyPayoutBotAllowedOrOwner() {
     const payoutCfg = await viewContract(WEEKLY_PAYOUT_CONTRACT_ID, "get_config", {});
     payoutOwner = String(payoutCfg?.owner || "").trim();
   } catch (err) {
-    log("[weekly] Could not read payout get_config. Falling back to is_bot_allowed check.");
+    log(
+      "[weekly] Could not read payout get_config. Falling back to is_bot_allowed check."
+    );
   }
 
   if (payoutOwner && payoutOwner === AIRDROP_BOT_ACCOUNT_ID) {
@@ -340,6 +407,85 @@ async function tickAirdrop() {
 }
 
 /**
+ * Reads payout status from the new upgraded weekly payout contract.
+ *
+ * Expected:
+ * get_payout_status({ epoch_id }) -> {
+ *   paid,
+ *   pending,
+ *   completed,
+ *   paid_count,
+ *   winner_count,
+ *   reward_amount_yocto,
+ *   next_from_index
+ * }
+ *
+ * If the upgraded method is not available for some reason, it falls back to
+ * is_epoch_paid({ epoch_id }) so the keeper does not hard-crash.
+ */
+async function getWeeklyPayoutStatus(epochId) {
+  const status = await safeViewContract(
+    WEEKLY_PAYOUT_CONTRACT_ID,
+    WEEKLY_PAYOUT_STATUS_METHOD,
+    {
+      epoch_id: String(epochId),
+    }
+  );
+
+  if (status) {
+    return {
+      epoch_id: String(status.epoch_id || epochId),
+      paid: status.paid === true,
+      pending: status.pending === true,
+      completed: status.completed === true,
+      paid_count: Number(status.paid_count || 0),
+      winner_count: Number(status.winner_count || 0),
+      reward_amount_yocto: String(status.reward_amount_yocto || "0"),
+      next_from_index: Number(status.next_from_index || 0),
+      source: WEEKLY_PAYOUT_STATUS_METHOD,
+    };
+  }
+
+  const alreadyPaid = await safeViewContract(
+    WEEKLY_PAYOUT_CONTRACT_ID,
+    WEEKLY_IS_PAID_METHOD,
+    {
+      epoch_id: String(epochId),
+    }
+  );
+
+  return {
+    epoch_id: String(epochId),
+    paid: alreadyPaid === true,
+    pending: false,
+    completed: alreadyPaid === true,
+    paid_count: 0,
+    winner_count: 0,
+    reward_amount_yocto: "0",
+    next_from_index: 0,
+    source: WEEKLY_IS_PAID_METHOD,
+  };
+}
+
+async function maybeStartNextWeeklyEpoch(epochId) {
+  if (!WEEKLY_AUTO_START_NEXT) {
+    log("[weekly] WEEKLY_AUTO_START_NEXT=false, not starting next epoch");
+    return;
+  }
+
+  log(
+    "[weekly] Epoch paid/completed:",
+    epochId,
+    "admin starting next weekly epoch using",
+    WEEKLY_START_METHOD,
+    "duration_sec:",
+    WEEKLY_START_DURATION_SEC
+  );
+
+  await callWeeklyXpStart();
+}
+
+/**
  * Weekly leaderboard keeper behavior.
  *
  * Expected XP view:
@@ -349,9 +495,10 @@ async function tickAirdrop() {
  *   ended
  * }
  *
- * Expected payout views/calls:
- * is_epoch_paid({ epoch_id })
- * finalize_weekly_payout({ epoch_id })
+ * Expected upgraded payout views/calls:
+ * get_payout_status({ epoch_id })
+ * finalize_weekly_payout({ epoch_id })       // creates snapshot only
+ * payout_weekly_batch({ epoch_id, limit })   // pays small chunk
  */
 async function tickWeekly() {
   if (!WEEKLY_KEEPER_ENABLED) return;
@@ -423,7 +570,12 @@ async function tickWeekly() {
 
   /**
    * XP epoch ended and is not active.
-   * Finalize payout using AIRDROP_BOT_ACCOUNT_ID if not already paid.
+   *
+   * New flow:
+   * 1. Check payout status.
+   * 2. If not pending and not paid, call finalize_weekly_payout to create snapshot.
+   * 3. If pending, call payout_weekly_batch until complete.
+   * 4. Only after paid/completed, start next weekly epoch.
    */
   if (!active && ended) {
     if (!epochId) {
@@ -431,48 +583,117 @@ async function tickWeekly() {
       return;
     }
 
-    const alreadyPaid = await viewContract(
-      WEEKLY_PAYOUT_CONTRACT_ID,
-      WEEKLY_IS_PAID_METHOD,
-      {
-        epoch_id: epochId,
-      }
-    );
+    const status = await getWeeklyPayoutStatus(epochId);
 
-    if (!alreadyPaid) {
+    log("[weekly] payout status:", {
+      epochId,
+      source: status.source,
+      paid: status.paid,
+      pending: status.pending,
+      completed: status.completed,
+      paid_count: status.paid_count,
+      winner_count: status.winner_count,
+      next_from_index: status.next_from_index,
+      reward_amount_yocto: status.reward_amount_yocto,
+    });
+
+    /**
+     * Fully paid. Now it is safe to start the next epoch.
+     */
+    if (status.paid === true || status.completed === true) {
+      await maybeStartNextWeeklyEpoch(epochId);
+      return;
+    }
+
+    /**
+     * No snapshot exists yet. Create it.
+     *
+     * This should not pay winners anymore after the contract upgrade.
+     */
+    if (status.pending !== true) {
+      if (inCooldown(weeklyFinalizeFailedAt)) {
+        log(
+          "[weekly] finalize recently failed, waiting before retrying epoch",
+          epochId
+        );
+        return;
+      }
+
       log(
-        "[weekly] Airdrop bot finalizing payout for epoch",
+        "[weekly] Airdrop bot creating payout snapshot for epoch",
         epochId,
         "bot:",
-        AIRDROP_BOT_ACCOUNT_ID
-      );
-
-      await callWeeklyPayout(
+        AIRDROP_BOT_ACCOUNT_ID,
+        "method:",
         WEEKLY_FINALIZE_METHOD,
-        {
-          epoch_id: epochId,
-        },
+        "gas:",
         WEEKLY_FINALIZE_GAS
       );
 
+      try {
+        await callWeeklyPayout(
+          WEEKLY_FINALIZE_METHOD,
+          {
+            epoch_id: epochId,
+          },
+          WEEKLY_FINALIZE_GAS,
+          "0"
+        );
+
+        weeklyFinalizeFailedAt = 0;
+      } catch (err) {
+        weeklyFinalizeFailedAt = nowMs();
+        throw err;
+      }
+
       return;
     }
 
-    log("[weekly] Epoch already paid:", epochId);
+    /**
+     * Snapshot exists. Pay the next small batch.
+     */
+    if (status.pending === true) {
+      if (inCooldown(weeklyBatchFailedAt)) {
+        log(
+          "[weekly] batch payout recently failed, waiting before retrying epoch",
+          epochId
+        );
+        return;
+      }
 
-    if (WEEKLY_AUTO_START_NEXT) {
-      log(
-        "[weekly] Admin starting next weekly epoch using",
-        WEEKLY_START_METHOD,
-        "duration_sec:",
-        WEEKLY_START_DURATION_SEC
-      );
+      const limit = Number.isFinite(WEEKLY_BATCH_LIMIT)
+        ? Math.max(1, Math.min(Math.floor(WEEKLY_BATCH_LIMIT), 10))
+        : 3;
 
-      await callWeeklyXpStart();
+      log("[weekly] Airdrop bot paying weekly batch:", {
+        epochId,
+        method: WEEKLY_BATCH_PAYOUT_METHOD,
+        paid_count: status.paid_count,
+        winner_count: status.winner_count,
+        next_from_index: status.next_from_index,
+        limit,
+        gas: WEEKLY_BATCH_GAS,
+      });
+
+      try {
+        await callWeeklyPayout(
+          WEEKLY_BATCH_PAYOUT_METHOD,
+          {
+            epoch_id: epochId,
+            limit,
+          },
+          WEEKLY_BATCH_GAS,
+          "0"
+        );
+
+        weeklyBatchFailedAt = 0;
+      } catch (err) {
+        weeklyBatchFailedAt = nowMs();
+        throw err;
+      }
+
       return;
     }
-
-    log("[weekly] WEEKLY_AUTO_START_NEXT=false, not starting next epoch");
   }
 }
 
@@ -504,7 +725,12 @@ async function main() {
     log("Weekly start method:", WEEKLY_START_METHOD);
     log("Weekly start duration:", WEEKLY_START_DURATION_SEC);
     log("Weekly end method:", WEEKLY_END_METHOD || "(disabled)");
-    log("Weekly finalize method:", WEEKLY_FINALIZE_METHOD);
+    log("Weekly finalize/snapshot method:", WEEKLY_FINALIZE_METHOD);
+    log("Weekly payout status method:", WEEKLY_PAYOUT_STATUS_METHOD);
+    log("Weekly batch payout method:", WEEKLY_BATCH_PAYOUT_METHOD);
+    log("Weekly batch limit:", WEEKLY_BATCH_LIMIT);
+    log("Weekly finalize gas:", WEEKLY_FINALIZE_GAS);
+    log("Weekly batch gas:", WEEKLY_BATCH_GAS);
     await ensureWeeklyPayoutBotAllowedOrOwner();
   } else {
     log("Weekly keeper disabled");
